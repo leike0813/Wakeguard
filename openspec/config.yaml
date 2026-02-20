@@ -1,0 +1,37 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+# Example:
+#   context: |
+#     Tech stack: TypeScript, React, Node.js
+#     We use conventional commits
+#     Domain: e-commerce platform
+context: |
+  Tech stack: Rust, Windows Service
+  Target OS: Windows 10/11
+  Core goal: disable wake capability for non-whitelisted devices
+  Whitelist storage: Windows Registry (HKLM\Software\Wakeguard)
+  Main device scope: keyboard, mouse, wired network adapter
+  Keep architecture modular and DRY
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+rules:
+  proposal:
+    - Include explicit "Non-goals"
+    - Keep scope for first milestone small and testable
+  design:
+    - Describe module boundaries and ownership
+    - Document assumptions and risk mitigations
+  tasks:
+    - Separate scaffolding from business implementation
+    - Include at least one verification task

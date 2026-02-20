@@ -1,0 +1,6 @@
+.codex/
+.vscode/
+.history/
+
+/target/
+
