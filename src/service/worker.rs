@@ -132,11 +132,18 @@ fn execute_scan_cycle(state: &mut WorkerState) -> Result<ScanReport, WakeguardEr
 
     let devices = powercfg::list_wake_programmable_devices()?;
     let wake_enabled_devices = powercfg::list_wake_enabled_devices()?;
-    let wake_enabled_names = wake_enabled_devices
+    let wake_enabled_members = wake_enabled_devices
         .iter()
-        .map(|d| (d.stable_id.clone(), d.display_name.clone()))
+        .map(|d| {
+            let members = if d.member_names.is_empty() {
+                vec![d.display_name.clone()]
+            } else {
+                d.member_names.clone()
+            };
+            (d.stable_id.clone(), members)
+        })
         .collect::<HashMap<_, _>>();
-    let wake_enabled_ids = wake_enabled_names.keys().cloned().collect::<HashSet<_>>();
+    let wake_enabled_ids = wake_enabled_members.keys().cloned().collect::<HashSet<_>>();
     let plan = policy::build_policy_plan(&devices, &whitelist);
     let mut disable_failures = 0usize;
 
@@ -168,21 +175,31 @@ fn execute_scan_cycle(state: &mut WorkerState) -> Result<ScanReport, WakeguardEr
             .disable_last_attempt_cycle
             .insert(action.stable_id.clone(), state.cycle);
 
-        let disable_target = wake_enabled_names
+        let disable_targets = wake_enabled_members
             .get(&action.stable_id)
-            .map(String::as_str)
-            .unwrap_or(action.device_name.as_str());
+            .cloned()
+            .unwrap_or_else(|| action.device_names.clone());
 
-        if let Err(err) = powercfg::disable_wake_for_device(disable_target) {
-            disable_failures += 1;
-            tracing::error!(
-                device = disable_target,
-                plan_device = action.device_name,
-                stable_id = action.stable_id,
-                reason = action.reason,
-                error = %err,
-                "disable wake action failed"
-            );
+        tracing::info!(
+            stable_id = action.stable_id,
+            family_members = ?action.device_names,
+            disable_targets = ?disable_targets,
+            reason = action.reason,
+            "disable wake action planned for family"
+        );
+
+        for disable_target in disable_targets {
+            if let Err(err) = powercfg::disable_wake_for_device(&disable_target) {
+                disable_failures += 1;
+                tracing::error!(
+                    device = disable_target,
+                    family_members = ?action.device_names,
+                    stable_id = action.stable_id,
+                    reason = action.reason,
+                    error = %err,
+                    "disable wake action failed"
+                );
+            }
         }
     }
 
@@ -286,6 +303,7 @@ mod tests {
         WakeDevice {
             display_name: name.to_string(),
             stable_id: id.to_string(),
+            member_names: vec![name.to_string()],
             class: DeviceClass::Unknown,
             identity_confidence: IdentityConfidence::High,
         }

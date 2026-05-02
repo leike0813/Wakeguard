@@ -5,6 +5,9 @@ pub enum WakeguardError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("windows api error: {0}")]
+    Windows(String),
+
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 

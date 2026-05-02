@@ -3,8 +3,8 @@ use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisableAction {
-    pub device_name: String,
     pub stable_id: String,
+    pub device_names: Vec<String>,
     pub reason: String,
 }
 
@@ -44,8 +44,12 @@ pub fn build_policy_plan(devices: &[WakeDevice], whitelist: &HashSet<String>) ->
         let decision = evaluate_device(device, whitelist);
         match &decision {
             PolicyDecision::Disable { reason } => disable_actions.push(DisableAction {
-                device_name: device.display_name.clone(),
                 stable_id: device.stable_id.clone(),
+                device_names: if device.member_names.is_empty() {
+                    vec![device.display_name.clone()]
+                } else {
+                    device.member_names.clone()
+                },
                 reason: reason.clone(),
             }),
             PolicyDecision::Observe { .. } => observed_devices.push(device.clone()),
@@ -88,6 +92,7 @@ mod tests {
         WakeDevice {
             display_name: stable_id.to_string(),
             stable_id: stable_id.to_string(),
+            member_names: vec![stable_id.to_string()],
             class: DeviceClass::Unknown,
             identity_confidence: confidence,
         }
@@ -134,5 +139,24 @@ mod tests {
         assert_eq!(plan.disable_actions.len(), 1);
         assert_eq!(plan.observed_devices.len(), 1);
         assert_eq!(plan.decisions.len(), 3);
+    }
+
+    #[test]
+    fn policy_plan_uses_family_member_names_for_disable_action() {
+        let whitelist = HashSet::new();
+        let device = WakeDevice {
+            display_name: "HID Keyboard Device".to_string(),
+            stable_id: "vidpid:vid_304e&pid_000a".to_string(),
+            member_names: vec![
+                "HID Keyboard Device".to_string(),
+                "HID Keyboard Device (003)".to_string(),
+            ],
+            class: DeviceClass::Keyboard,
+            identity_confidence: IdentityConfidence::High,
+        };
+
+        let plan = build_policy_plan(&[device], &whitelist);
+        assert_eq!(plan.disable_actions.len(), 1);
+        assert_eq!(plan.disable_actions[0].device_names.len(), 2);
     }
 }

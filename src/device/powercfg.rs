@@ -1,5 +1,6 @@
 use crate::device::{
     identity::{build_device, build_device_strict},
+    topology::{load_wake_leaf_observations, snapshot_present_devices, DeviceTopology, WakeLeafObservation},
     DeviceSource, WakeDevice, WakeDeviceRaw,
 };
 use crate::error::WakeguardError;
@@ -7,55 +8,46 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::time::SystemTime;
 
-const DEVICE_QUERY_WAKE_ARMED: &str = "wake_armed";
 const DEVICE_QUERY_WAKE_PROGRAMMABLE: &str = "wake_programmable";
 const DEVICE_DISABLE_WAKE_ARG: &str = "-devicedisablewake";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum StrictIdentityCandidate {
-    VidPid(String),
-    PciVenDev(String),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PowercfgEntry {
+    display_name: String,
+    normalized_name: String,
 }
 
-impl StrictIdentityCandidate {
-    fn as_sort_key(&self) -> String {
-        match self {
-            Self::VidPid(value) => format!("vidpid:{value}"),
-            Self::PciVenDev(value) => format!("pci:{value}"),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedPowercfgEntry {
+    raw: WakeDeviceRaw,
+    wake_enabled: bool,
 }
 
 pub fn list_wake_enabled_devices() -> Result<Vec<WakeDevice>, WakeguardError> {
-    query_powercfg_devices(DEVICE_QUERY_WAKE_ARMED, "powercfg -devicequery wake_armed")
+    query_powercfg_devices(true)
 }
 
 pub fn list_wake_programmable_devices() -> Result<Vec<WakeDevice>, WakeguardError> {
-    query_powercfg_devices(
-        DEVICE_QUERY_WAKE_PROGRAMMABLE,
-        "powercfg -devicequery wake_programmable",
-    )
+    query_powercfg_devices(false)
 }
 
-fn query_powercfg_devices(
-    query_target: &str,
-    command_display: &str,
-) -> Result<Vec<WakeDevice>, WakeguardError> {
-    let stdout = run_powercfg_query_utf8(query_target, command_display)?;
-    let candidates = match load_identity_candidates_from_wmi() {
-        Ok(map) => map,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "failed to load strict identity candidates, fallback will be limited"
-            );
-            HashMap::new()
-        }
-    };
+fn query_powercfg_devices(only_enabled: bool) -> Result<Vec<WakeDevice>, WakeguardError> {
+    let stdout = run_powercfg_query_utf8(
+        DEVICE_QUERY_WAKE_PROGRAMMABLE,
+        "powercfg -devicequery wake_programmable",
+    )?;
+    let powercfg_entries = parse_powercfg_entries(&stdout);
+    let topology = snapshot_present_devices()?;
+    let wake_leafs = load_wake_leaf_observations()?;
 
-    let raws = parse_wake_output_with_identity_candidates(&stdout, &candidates);
+    let raws = resolve_powercfg_entries(powercfg_entries, &wake_leafs, &topology)
+        .into_iter()
+        .filter(|entry| !only_enabled || entry.wake_enabled)
+        .map(|entry| entry.raw)
+        .collect::<Vec<_>>();
+
     let devices = build_strict_devices(raws);
-    Ok(deduplicate_devices(devices))
+    Ok(aggregate_wake_devices(devices))
 }
 
 fn run_powercfg_query_utf8(query_target: &str, command_display: &str) -> Result<String, WakeguardError> {
@@ -99,30 +91,149 @@ pub fn disable_wake_for_device(device_name: &str) -> Result<(), WakeguardError> 
 
 #[cfg(test)]
 pub(crate) fn parse_wake_armed_output(raw: &str) -> Vec<WakeDeviceRaw> {
-    parse_wake_output_with_identity_candidates(raw, &HashMap::new())
+    parse_powercfg_entries(raw)
+        .into_iter()
+        .map(|entry| WakeDeviceRaw {
+            name: entry.display_name,
+            member_name: None,
+            source: DeviceSource::PowerCfg,
+            observed_at: SystemTime::now(),
+            system_id: None,
+            hardware_id: None,
+            serial_number: None,
+        })
+        .collect()
 }
 
-fn parse_wake_output_with_identity_candidates(
-    raw: &str,
-    identity_candidates: &HashMap<String, Vec<StrictIdentityCandidate>>,
-) -> Vec<WakeDeviceRaw> {
+fn parse_powercfg_entries(raw: &str) -> Vec<PowercfgEntry> {
     raw.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .filter(|line| !is_no_device_marker(line))
-        .map(|line| {
-            let (system_id, hardware_id, serial_number) =
-                infer_identity_signals(line, identity_candidates);
-            WakeDeviceRaw {
-                name: line.to_string(),
-                source: DeviceSource::PowerCfg,
-                observed_at: SystemTime::now(),
-                system_id,
-                hardware_id,
-                serial_number,
-            }
+        .map(|line| PowercfgEntry {
+            display_name: line.to_string(),
+            normalized_name: normalize_device_name_for_match(line),
         })
         .collect()
+}
+
+fn resolve_powercfg_entries(
+    entries: Vec<PowercfgEntry>,
+    wake_leafs: &[WakeLeafObservation],
+    topology: &DeviceTopology,
+) -> Vec<ResolvedPowercfgEntry> {
+    let mut grouped_entries: HashMap<String, Vec<PowercfgEntry>> = HashMap::new();
+    for entry in entries {
+        grouped_entries
+            .entry(entry.normalized_name.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut grouped_leafs: HashMap<String, Vec<&WakeLeafObservation>> = HashMap::new();
+    for leaf in wake_leafs {
+        grouped_leafs
+            .entry(normalize_device_name_for_match(&leaf.display_name))
+            .or_default()
+            .push(leaf);
+    }
+
+    let mut keys = grouped_entries.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+
+    let mut resolved = Vec::new();
+    for key in keys {
+        let Some(entry_group) = grouped_entries.remove(&key) else {
+            continue;
+        };
+        let leaf_group = grouped_leafs.remove(&key).unwrap_or_default();
+
+        if leaf_group.is_empty() {
+            let missing_names = entry_group
+                .iter()
+                .map(|entry| entry.display_name.as_str())
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                normalized_name = key,
+                powercfg_names = ?missing_names,
+                "skipping wake devices because no matching wake leafs were found"
+            );
+            continue;
+        }
+
+        if entry_group.len() != leaf_group.len() {
+            tracing::warn!(
+                normalized_name = key,
+                powercfg_count = entry_group.len(),
+                wake_leaf_count = leaf_group.len(),
+                powercfg_names = ?entry_group.iter().map(|entry| entry.display_name.as_str()).collect::<Vec<_>>(),
+                wake_leaf_ids = ?leaf_group.iter().map(|leaf| leaf.instance_id.as_str()).collect::<Vec<_>>(),
+                "powercfg and wake leaf counts differ; pairing by current observation order"
+            );
+        }
+
+        for (entry, leaf) in entry_group.iter().zip(leaf_group.iter()) {
+            if let Some(resolved_entry) = resolve_powercfg_entry(entry, leaf, topology) {
+                resolved.push(resolved_entry);
+            }
+        }
+    }
+
+    for (normalized_name, leaf_group) in grouped_leafs {
+        tracing::debug!(
+            normalized_name,
+            wake_leaf_ids = ?leaf_group.iter().map(|leaf| leaf.instance_id.as_str()).collect::<Vec<_>>(),
+            "wake leaf group had no matching powercfg names"
+        );
+    }
+
+    resolved
+}
+
+fn resolve_powercfg_entry(
+    entry: &PowercfgEntry,
+    leaf: &WakeLeafObservation,
+    topology: &DeviceTopology,
+) -> Option<ResolvedPowercfgEntry> {
+    match topology.resolve_family(&leaf.instance_id) {
+        Ok(family) => {
+            tracing::debug!(
+                powercfg_name = entry.display_name,
+                leaf_instance_id = leaf.instance_id,
+                lineage = ?family.lineage,
+                family_vidpid = family.hardware_id,
+                family_sys = family.system_id,
+                representative_name = family.representative_name,
+                "resolved wake leaf to managed family"
+            );
+
+            Some(ResolvedPowercfgEntry {
+                raw: WakeDeviceRaw {
+                    name: family
+                        .representative_name
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| entry.display_name.clone()),
+                    member_name: Some(entry.display_name.clone()),
+                    source: DeviceSource::PowerCfg,
+                    observed_at: SystemTime::now(),
+                    system_id: family.system_id,
+                    hardware_id: family.hardware_id,
+                    serial_number: None,
+                },
+                wake_enabled: leaf.wake_enabled,
+            })
+        }
+        Err(err) => {
+            tracing::warn!(
+                display_name = entry.display_name,
+                leaf_instance_id = leaf.instance_id,
+                stage = err.stage,
+                lineage = ?err.lineage,
+                "skipping wake device because parent-chain family resolution failed"
+            );
+            None
+        }
+    }
 }
 
 fn is_no_device_marker(line: &str) -> bool {
@@ -131,42 +242,6 @@ fn is_no_device_marker(line: &str) -> bool {
         normalized.as_str(),
         "none" | "no" | "n/a" | "无" | "沒有" | "没有"
     )
-}
-
-fn infer_identity_signals(
-    line: &str,
-    identity_candidates: &HashMap<String, Vec<StrictIdentityCandidate>>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let trimmed = line.trim();
-    let normalized_name = normalize_device_name_for_match(trimmed);
-    let duplicate_index = parse_duplicate_index(trimmed);
-    let candidate = pick_identity_candidate(identity_candidates.get(&normalized_name), duplicate_index);
-
-    let direct_vid_pid = normalize_vid_pid_fragment(trimmed);
-    let direct_ven_dev = normalize_ven_dev_fragment(trimmed);
-
-    let hardware_id = direct_vid_pid.or_else(|| match candidate.as_ref() {
-        Some(StrictIdentityCandidate::VidPid(value)) => Some(value.clone()),
-        _ => None,
-    });
-    let system_id = direct_ven_dev.or_else(|| match candidate {
-        Some(StrictIdentityCandidate::PciVenDev(value)) => Some(value),
-        _ => None,
-    });
-
-    (system_id, hardware_id, None)
-}
-
-fn pick_identity_candidate(
-    candidates: Option<&Vec<StrictIdentityCandidate>>,
-    duplicate_index: usize,
-) -> Option<StrictIdentityCandidate> {
-    let list = candidates?;
-    if list.is_empty() {
-        return None;
-    }
-    let idx = duplicate_index.saturating_sub(1).min(list.len() - 1);
-    list.get(idx).cloned()
 }
 
 fn build_strict_devices(raws: Vec<WakeDeviceRaw>) -> Vec<WakeDevice> {
@@ -188,99 +263,34 @@ fn build_strict_devices(raws: Vec<WakeDeviceRaw>) -> Vec<WakeDevice> {
     devices
 }
 
-fn load_identity_candidates_from_wmi() -> Result<HashMap<String, Vec<StrictIdentityCandidate>>, WakeguardError> {
-    let script = r#"$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding;
-$nameByPnp = @{};
-Get-CimInstance Win32_PnPEntity |
-Where-Object { $_.Name -and $_.PNPDeviceID } |
-ForEach-Object { $nameByPnp[$_.PNPDeviceID.ToUpper()] = $_.Name };
-Get-CimInstance -Namespace root/wmi -Class MSPower_DeviceWakeEnable |
-ForEach-Object {
-    $pnp = ($_.InstanceName -replace '_[0-9]+$','').ToUpper();
-    $name = $nameByPnp[$pnp];
-    if ($name) {
-        $norm = $name.Trim();
-        if ($norm -match '^(.*) \((\d+)\)$') { $norm = $Matches[1].TrimEnd() }
-        $norm = $norm.ToLowerInvariant();
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($norm);
-        $hex = [System.BitConverter]::ToString($bytes).Replace('-','');
-        "{0}`t{1}" -f $hex, $pnp
-    }
-}"#;
+fn aggregate_wake_devices(devices: Vec<WakeDevice>) -> Vec<WakeDevice> {
+    let mut grouped = HashMap::<String, WakeDevice>::new();
 
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", script])
-        .output()?;
-
-    if !output.status.success() {
-        return Err(WakeguardError::CommandFailed {
-            command: "powershell MSPower_DeviceWakeEnable lookup".to_string(),
-            details: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_identity_candidates_from_wmi_output(&stdout))
-}
-
-fn parse_identity_candidates_from_wmi_output(
-    raw: &str,
-) -> HashMap<String, Vec<StrictIdentityCandidate>> {
-    let mut grouped: HashMap<String, Vec<StrictIdentityCandidate>> = HashMap::new();
-
-    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let mut parts = line.splitn(2, '\t');
-        let Some(name_key_hex) = parts.next() else {
-            continue;
-        };
-        let Some(pnp_device_id) = parts.next() else {
-            continue;
-        };
-        let Some(name_key) = decode_hex_utf8(name_key_hex) else {
-            continue;
+    for device in devices {
+        let stable_id = device.stable_id.clone();
+        let member_names = if device.member_names.is_empty() {
+            vec![device.display_name.clone()]
+        } else {
+            device.member_names.clone()
         };
 
-        let Some(candidate) = parse_strict_identity_candidate(pnp_device_id) else {
+        if let Some(existing) = grouped.get_mut(&stable_id) {
+            for member_name in member_names {
+                if !existing.member_names.iter().any(|known| known == &member_name) {
+                    existing.member_names.push(member_name);
+                }
+            }
             continue;
-        };
+        }
 
-        grouped.entry(name_key).or_default().push(candidate);
+        let mut device = device;
+        device.member_names = member_names;
+        grouped.insert(stable_id, device);
     }
 
-    for values in grouped.values_mut() {
-        values.sort_by_key(StrictIdentityCandidate::as_sort_key);
-        values.dedup();
-    }
-
-    grouped
-}
-
-fn decode_hex_utf8(hex: &str) -> Option<String> {
-    let trimmed = hex.trim();
-    if trimmed.is_empty() || trimmed.len() % 2 != 0 {
-        return None;
-    }
-
-    let mut bytes = Vec::with_capacity(trimmed.len() / 2);
-    let chars = trimmed.as_bytes();
-    let mut idx = 0usize;
-    while idx < chars.len() {
-        let pair = std::str::from_utf8(&chars[idx..idx + 2]).ok()?;
-        let value = u8::from_str_radix(pair, 16).ok()?;
-        bytes.push(value);
-        idx += 2;
-    }
-    String::from_utf8(bytes).ok()
-}
-
-fn parse_strict_identity_candidate(raw: &str) -> Option<StrictIdentityCandidate> {
-    if let Some(vid_pid) = normalize_vid_pid_fragment(raw) {
-        return Some(StrictIdentityCandidate::VidPid(vid_pid));
-    }
-    if let Some(ven_dev) = normalize_ven_dev_fragment(raw) {
-        return Some(StrictIdentityCandidate::PciVenDev(ven_dev));
-    }
-    None
+    let mut aggregated = grouped.into_values().collect::<Vec<_>>();
+    aggregated.sort_by(|left, right| left.stable_id.cmp(&right.stable_id));
+    aggregated
 }
 
 pub(crate) fn normalize_device_name_for_match(name: &str) -> String {
@@ -311,18 +321,6 @@ fn strip_trailing_numeric_suffix(name: &str) -> &str {
         return name;
     }
     name[..open_idx].trim_end()
-}
-
-fn parse_duplicate_index(name: &str) -> usize {
-    let trimmed = name.trim();
-    let Some(open_idx) = trimmed.rfind(" (") else {
-        return 1;
-    };
-    if !trimmed.ends_with(')') {
-        return 1;
-    }
-    let digits = &trimmed[(open_idx + 2)..(trimmed.len() - 1)];
-    digits.parse::<usize>().unwrap_or(1)
 }
 
 pub(crate) fn normalize_vid_pid_fragment(raw: &str) -> Option<String> {
@@ -365,27 +363,15 @@ fn extract_hex_segment(input: &str, prefix: &str) -> Option<String> {
     Some(segment[(segment.len() - 4)..].to_string())
 }
 
-fn deduplicate_devices(devices: Vec<WakeDevice>) -> Vec<WakeDevice> {
-    let mut seen = std::collections::HashSet::new();
-    let mut unique = Vec::with_capacity(devices.len());
-    for device in devices {
-        if seen.insert(device.stable_id.clone()) {
-            unique.push(device);
-        }
-    }
-    unique
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_hex_utf8,
-        normalize_device_name_for_match, normalize_ven_dev_fragment, normalize_vid_pid_fragment,
-        parse_identity_candidates_from_wmi_output, parse_wake_armed_output,
-        parse_wake_output_with_identity_candidates,
+        aggregate_wake_devices, normalize_device_name_for_match, normalize_ven_dev_fragment,
+        normalize_vid_pid_fragment, parse_powercfg_entries, parse_wake_armed_output,
+        resolve_powercfg_entries,
     };
-    use crate::device::identity::build_device_strict;
-    use std::collections::HashMap;
+    use crate::device::topology::{DeviceNode, DeviceTopology, WakeLeafObservation};
+    use crate::device::{identity::build_device_strict, DeviceClass, IdentityConfidence, WakeDevice};
 
     #[test]
     fn parse_powercfg_output_skips_empty_lines() {
@@ -425,30 +411,86 @@ mod tests {
     }
 
     #[test]
-    fn parse_identity_candidates_groups_by_normalized_name() {
-        let raw = "\
-686964206b6579626f61726420646576696365\tHID\\VID_046D&PID_C52B&MI_00\\A\r\n\
-686964206b6579626f61726420646576696365\tHID\\VID_046D&PID_C537&MI_00\\B\r\n\
-686964206b6579626f61726420646576696365\tHID\\VID_046D&PID_C52B&MI_00\\A\r\n";
+    fn resolve_powercfg_entries_groups_hid_children_into_one_family() {
+        let entries = parse_powercfg_entries("HID Keyboard Device (002)\r\nHID Keyboard Device (003)\r\n");
+        let wake_leafs = vec![
+            WakeLeafObservation {
+                instance_id: "HID\\VID_304E&PID_000A&MI_00\\A".to_string(),
+                display_name: "HID Keyboard Device".to_string(),
+                wake_enabled: true,
+            },
+            WakeLeafObservation {
+                instance_id: "HID\\VID_304E&PID_000A&MI_01\\B".to_string(),
+                display_name: "HID Keyboard Device".to_string(),
+                wake_enabled: false,
+            },
+        ];
+        let topology = DeviceTopology::from_nodes(vec![
+            DeviceNode {
+                instance_id: "HID\\VID_304E&PID_000A&MI_00\\A".to_string(),
+                parent_instance_id: Some("USB\\ROOT".to_string()),
+                container_id: None,
+                display_name: Some("Wireless Keyboard".to_string()),
+                hardware_ids: vec![],
+                hardware_id: Some("VID_304E&PID_000A".to_string()),
+                system_id: None,
+            },
+            DeviceNode {
+                instance_id: "HID\\VID_304E&PID_000A&MI_01\\B".to_string(),
+                parent_instance_id: Some("USB\\ROOT".to_string()),
+                container_id: None,
+                display_name: Some("Wireless Keyboard".to_string()),
+                hardware_ids: vec![],
+                hardware_id: Some("VID_304E&PID_000A".to_string()),
+                system_id: None,
+            },
+            DeviceNode {
+                instance_id: "USB\\ROOT".to_string(),
+                parent_instance_id: None,
+                container_id: None,
+                display_name: Some("Wireless Keyboard".to_string()),
+                hardware_ids: vec![],
+                hardware_id: None,
+                system_id: None,
+            },
+        ]);
 
-        let map = parse_identity_candidates_from_wmi_output(raw);
-        let values = map
-            .get("hid keyboard device")
-            .expect("normalized key should exist");
-        assert!(values.len() >= 2);
+        let raws = resolve_powercfg_entries(entries, &wake_leafs, &topology)
+            .into_iter()
+            .map(|entry| entry.raw)
+            .collect::<Vec<_>>();
+        let accepted = raws
+            .into_iter()
+            .filter_map(build_device_strict)
+            .collect::<Vec<_>>();
+        let aggregated = aggregate_wake_devices(accepted);
+
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(aggregated[0].stable_id, "vidpid:vid_304e&pid_000a");
+        assert_eq!(aggregated[0].member_names.len(), 2);
+        assert_eq!(aggregated[0].display_name, "Wireless Keyboard");
     }
 
     #[test]
-    fn parse_output_matches_candidates_after_numeric_suffix_normalization() {
-        let candidates = parse_identity_candidates_from_wmi_output(
-            "686964206b6579626f61726420646576696365\tHID\\VID_046D&PID_C52B&MI_00\\A\r\n",
-        );
-        let devices = parse_wake_output_with_identity_candidates(
-            "HID Keyboard Device (003)\r\n",
-            &candidates,
-        );
-        assert_eq!(devices.len(), 1);
-        assert_eq!(devices[0].hardware_id.as_deref(), Some("VID_046D&PID_C52B"));
+    fn resolve_powercfg_entries_skips_unmanaged_leaf() {
+        let entries = parse_powercfg_entries("Generic Device\r\n");
+        let wake_leafs = vec![WakeLeafObservation {
+            instance_id: "ROOT\\UNKNOWN\\0001".to_string(),
+            display_name: "Generic Device".to_string(),
+            wake_enabled: true,
+        }];
+        let topology = DeviceTopology::from_nodes(vec![DeviceNode {
+            instance_id: "ROOT\\UNKNOWN\\0001".to_string(),
+            parent_instance_id: None,
+            container_id: None,
+            display_name: Some("Generic Device".to_string()),
+            hardware_ids: vec![],
+            hardware_id: None,
+            system_id: None,
+        }]);
+
+        let resolved = resolve_powercfg_entries(entries, &wake_leafs, &topology);
+        assert!(resolved.is_empty());
     }
 
     #[test]
@@ -469,38 +511,27 @@ mod tests {
     }
 
     #[test]
-    fn strict_builder_accepts_pci_and_vidpid_candidates() {
-        let mut candidates = HashMap::new();
-        candidates.insert(
-            "intel(r) i211 gigabit network connection".to_string(),
-            vec![super::StrictIdentityCandidate::PciVenDev(
-                "VEN_8086&DEV_1539".to_string(),
-            )],
-        );
-        candidates.insert(
-            "hid keyboard device".to_string(),
-            vec![super::StrictIdentityCandidate::VidPid(
-                "VID_046D&PID_C52B".to_string(),
-            )],
-        );
+    fn aggregate_wake_devices_groups_same_family_members() {
+        let devices = vec![
+            WakeDevice {
+                display_name: "Wireless Keyboard".to_string(),
+                stable_id: "vidpid:vid_304e&pid_000a".to_string(),
+                member_names: vec!["HID Keyboard Device".to_string()],
+                class: DeviceClass::Keyboard,
+                identity_confidence: IdentityConfidence::High,
+            },
+            WakeDevice {
+                display_name: "Wireless Keyboard".to_string(),
+                stable_id: "vidpid:vid_304e&pid_000a".to_string(),
+                member_names: vec!["HID Keyboard Device (003)".to_string()],
+                class: DeviceClass::Keyboard,
+                identity_confidence: IdentityConfidence::High,
+            },
+        ];
 
-        let raws = parse_wake_output_with_identity_candidates(
-            "Intel(R) I211 Gigabit Network Connection\r\nHID Keyboard Device (003)\r\n",
-            &candidates,
-        );
-        let accepted = raws
-            .into_iter()
-            .filter_map(build_device_strict)
-            .collect::<Vec<_>>();
-
-        assert_eq!(accepted.len(), 2);
-    }
-
-    #[test]
-    fn decode_hex_utf8_handles_unicode() {
-        let decoded = decode_hex_utf8("e7aca6e590882048494420e6a087e58786")
-            .expect("hex should decode");
-        assert_eq!(decoded, "符合 HID 标准");
+        let aggregated = aggregate_wake_devices(devices);
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(aggregated[0].member_names.len(), 2);
     }
 
     #[test]

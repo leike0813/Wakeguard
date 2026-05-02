@@ -6,6 +6,7 @@ fn make_device(stable_id: &str, display_name: &str) -> WakeDevice {
     WakeDevice {
         display_name: display_name.to_string(),
         stable_id: stable_id.to_string(),
+        member_names: vec![display_name.to_string()],
         class: DeviceClass::Unknown,
         identity_confidence: IdentityConfidence::High,
     }
@@ -35,4 +36,16 @@ fn new_device_events_include_whitelist_status() {
     assert_eq!(events[0].event, "new_wake_device_detected");
     assert!(!events[0].is_whitelisted);
     assert!(events[1].is_whitelisted);
+}
+
+#[test]
+fn renumbered_family_is_not_treated_as_new_device() {
+    let previous = HashSet::from(["vidpid:vid_304e&pid_000a".to_string()]);
+    let current = vec![make_device(
+        "vidpid:vid_304e&pid_000a",
+        "HID Keyboard Device (003)",
+    )];
+
+    let new_devices = detect_new_devices(&previous, &current);
+    assert!(new_devices.is_empty());
 }

@@ -67,9 +67,11 @@ pub fn classify_device_class(device_name: &str) -> DeviceClass {
 
 pub fn build_device(raw: WakeDeviceRaw) -> WakeDevice {
     let identity = resolve_identity(&raw);
+    let member_name = raw.member_name.clone().unwrap_or_else(|| raw.name.clone());
     WakeDevice {
         display_name: raw.name.clone(),
         stable_id: identity.stable_id,
+        member_names: vec![member_name],
         class: classify_device_class(&raw.name),
         identity_confidence: identity.confidence,
     }
@@ -82,10 +84,12 @@ pub fn build_device_strict(raw: WakeDeviceRaw) -> Option<WakeDevice> {
         IdentityMethod::SystemId if is_strict_system_identity(&identity.stable_id) => {}
         _ => return None,
     }
+    let member_name = raw.member_name.clone().unwrap_or_else(|| raw.name.clone());
 
     Some(WakeDevice {
         display_name: raw.name.clone(),
         stable_id: identity.stable_id,
+        member_names: vec![member_name],
         class: classify_device_class(&raw.name),
         identity_confidence: identity.confidence,
     })
@@ -105,6 +109,7 @@ mod tests {
     fn raw_with_name(name: &str) -> WakeDeviceRaw {
         WakeDeviceRaw {
             name: name.to_string(),
+            member_name: None,
             source: DeviceSource::TestFixture,
             observed_at: SystemTime::now(),
             system_id: None,

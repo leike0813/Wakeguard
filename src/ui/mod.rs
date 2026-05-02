@@ -20,7 +20,7 @@ pub fn launch_ui(onboarding: bool) -> Result<(), WakeguardError> {
         println!(
             "  {}. {} [{}] whitelist={} wake_disabled={}",
             idx + 1,
-            device.display_name,
+            format_device_label(device),
             device.stable_id,
             in_whitelist,
             wake_disabled
@@ -34,6 +34,14 @@ pub fn launch_ui(onboarding: bool) -> Result<(), WakeguardError> {
     }
 
     Ok(())
+}
+
+fn format_device_label(device: &crate::device::WakeDevice) -> String {
+    let member_count = device.member_names.len();
+    if member_count <= 1 {
+        return device.display_name.clone();
+    }
+    format!("{} (+{} family members)", device.display_name, member_count - 1)
 }
 
 fn run_onboarding(
@@ -107,7 +115,8 @@ fn parse_selection_indices(raw: &str, len: usize) -> Result<Vec<usize>, Wakeguar
 
 #[cfg(test)]
 mod tests {
-    use super::parse_selection_indices;
+    use super::{format_device_label, parse_selection_indices};
+    use crate::device::{DeviceClass, IdentityConfidence, WakeDevice};
 
     #[test]
     fn parse_selection_indices_handles_basic_case() {
@@ -119,5 +128,24 @@ mod tests {
     fn parse_selection_indices_rejects_out_of_range() {
         let err = parse_selection_indices("4", 3).expect_err("should reject out of range");
         assert!(format!("{err}").contains("index out of range"));
+    }
+
+    #[test]
+    fn format_device_label_shows_family_members() {
+        let device = WakeDevice {
+            display_name: "HID Keyboard Device".to_string(),
+            stable_id: "vidpid:vid_304e&pid_000a".to_string(),
+            member_names: vec![
+                "HID Keyboard Device".to_string(),
+                "HID Keyboard Device (003)".to_string(),
+            ],
+            class: DeviceClass::Keyboard,
+            identity_confidence: IdentityConfidence::High,
+        };
+
+        assert_eq!(
+            format_device_label(&device),
+            "HID Keyboard Device (+1 family members)"
+        );
     }
 }

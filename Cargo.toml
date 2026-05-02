@@ -12,5 +12,9 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 winreg = "0.52"
-windows = { version = "0.58", features = ["Win32_Foundation"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+] }
 windows-service = "0.7"

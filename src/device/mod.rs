@@ -1,5 +1,6 @@
 pub mod identity;
 pub mod powercfg;
+pub mod topology;
 
 use std::time::SystemTime;
 
@@ -28,6 +29,7 @@ pub enum IdentityConfidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeDeviceRaw {
     pub name: String,
+    pub member_name: Option<String>,
     pub source: DeviceSource,
     pub observed_at: SystemTime,
     pub system_id: Option<String>,
@@ -39,6 +41,7 @@ pub struct WakeDeviceRaw {
 pub struct WakeDevice {
     pub display_name: String,
     pub stable_id: String,
+    pub member_names: Vec<String>,
     pub class: DeviceClass,
     pub identity_confidence: IdentityConfidence,
 }
